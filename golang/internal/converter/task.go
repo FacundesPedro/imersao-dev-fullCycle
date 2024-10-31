@@ -1,7 +1,6 @@
 package converter
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -13,170 +12,166 @@ import (
 	"sort"
 	"strconv"
 	"time"
-	"imersaofc/pkg/rabbitmq"
-	"github.com/streadway/amqp"
 )
 
-// VideoConverter handles video conversion tasks
 type VideoConverter struct {
-	rabbitClient *rabbitmq.RabbitClient
-	db           *sql.DB
-	rootPath     string
+	DB *sql.DB
 }
 
-// VideoTask represents a video conversion task
+func NewVideoConverter(DB *sql.DB) *VideoConverter {
+	return &VideoConverter{
+		DB: DB,
+	}
+}
+
 type VideoTask struct {
-	VideoID int    `json:"video_id"`
+	VideoId int    `json:"video_id"`
 	Path    string `json:"path"`
 }
 
-// NewVideoConverter creates a new instance of VideoConverter
-func NewVideoConverter(rabbitClient *rabbitmq.RabbitClient, db *sql.DB, rootPath string) *VideoConverter {
-	return &VideoConverter{
-		rabbitClient: rabbitClient,
-		db:           db,
-		rootPath:     rootPath,
-	}
-}
+// const pattern = "*.chunk"
 
-// HandleMessage processes a video conversion message
-func (vc *VideoConverter) HandleMessage(ctx context.Context, d amqp.Delivery, conversionExch, confirmationKey, confirmationQueue string) {
-	var task VideoTask
+func (vc *VideoConverter) Handle(msgBytes []byte, convertedFileName, mergedFileName string) {
+	var thread VideoTask
 
-	if err := json.Unmarshal(d.Body, &task); err != nil {
-		vc.logError(task, "Failed to deserialize message", err)
-		d.Ack(false)
+	err := json.Unmarshal(msgBytes, &thread)
+	if err != nil {
+		vc.LogError(thread, "Failed to unmarshal task", err)
 		return
 	}
 
-	// Check if the video has already been processed
-	if IsProcessed(vc.db, task.VideoID) {
-		slog.Warn("Video already processed", slog.Int("video_id", task.VideoID))
-		d.Ack(false)
+	if IsProcessed(vc.DB, thread.VideoId) {
+		slog.Warn("Video was already processed", slog.Int("video_id", thread.VideoId))
 		return
 	}
 
-	// Process the video
-	err := vc.processVideo(&task)
+	err = vc.process(&thread, convertedFileName, mergedFileName)
 	if err != nil {
-		vc.logError(task, "Error during video conversion", err)
-		d.Ack(false)
+		vc.LogError(thread, "Failed to process video with id="+string(thread.VideoId), err)
 		return
 	}
-	slog.Info("Video conversion processed", slog.Int("video_id", task.VideoID))
 
-	// Mark as processed
-	err = MarkProcessed(vc.db, task.VideoID)
+	err = MarkProcessed(vc.DB, thread.VideoId)
 	if err != nil {
-		vc.logError(task, "Failed to mark video as processed", err)
+		vc.LogError(thread, "Failed to mark video as processed video_id="+string(thread.VideoId), err)
+		return
 	}
-	d.Ack(false)
-	slog.Info("Video marked as processed", slog.Int("video_id", task.VideoID))
 
-	// Publicar a mensagem de confirmação
-	confirmationMessage := []byte(fmt.Sprintf(`{"video_id": %d, "path":"%s"}`, task.VideoID, task.Path))
-	err = vc.rabbitClient.PublishMessage(conversionExch, confirmationKey, confirmationQueue, confirmationMessage)
-	if err != nil {
-		slog.Error("Failed to publish confirmation message", slog.String("error", err.Error()))
-	}
-	slog.Info("Published confirmation message", slog.Int("video_id", task.VideoID))
+	slog.Info("Video was succesfully processed", slog.Int("video_id", thread.VideoId))
 }
 
-// processVideo handles video processing (merging chunks and converting)
-func (vc *VideoConverter) processVideo(task *VideoTask) error {
-	chunkPath := filepath.Join(vc.rootPath, fmt.Sprintf("%d", task.VideoID))
-	mergedFile := filepath.Join(chunkPath, "merged.mp4")
-	mpegDashPath := filepath.Join(chunkPath, "mpeg-dash")
-
-	// Merge chunks
-	slog.Info("Merging chunks", slog.String("path", chunkPath))
-	if err := vc.mergeChunks(chunkPath, mergedFile); err != nil {
-		return fmt.Errorf("failed to merge chunks: %v", err)
-	}
-
-	// Create directory for MPEG-DASH output
-	if err := os.MkdirAll(mpegDashPath, os.ModePerm); err != nil {
-		return fmt.Errorf("failed to create output directory: %v", err)
-	}
-
-	// Convert to MPEG-DASH
-	ffmpegCmd := exec.Command(
-		"ffmpeg", "-i", mergedFile, // Arquivo de entrada
-		"-f", "dash", // Formato de saída
-		filepath.Join(mpegDashPath, "output.mpd"), // Caminho para salvar o arquivo .mpd
-	)
-
-	output, err := ffmpegCmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to convert to MPEG-DASH: %v, output: %s", err, string(output))
-	}
-	slog.Info("Converted to MPEG-DASH", slog.String("path", mpegDashPath))
-
-	// Remove merged file after processing
-	if err := os.Remove(mergedFile); err != nil {
-		slog.Warn("Failed to remove merged file", slog.String("file", mergedFile), slog.String("error", err.Error()))
-	}
-	slog.Info("Removed merged file", slog.String("file", mergedFile))
-
-	return nil
-}
-
-// Método para extrair o número do nome do arquivo
-func (vc *VideoConverter) extractNumber(fileName string) int {
-	re := regexp.MustCompile(`\d+`)
-	numStr := re.FindString(filepath.Base(fileName)) // Pega o nome do arquivo, sem o caminho
-	num, _ := strconv.Atoi(numStr)
-	return num
-}
-
-// Método para mesclar os chunks
-func (vc *VideoConverter) mergeChunks(inputDir, outputFile string) error {
-	// Buscar todos os arquivos .chunk no diretório
-	chunks, err := filepath.Glob(filepath.Join(inputDir, "*.chunk"))
-	if err != nil {
-		return fmt.Errorf("failed to find chunks: %v", err)
-	}
-
-	// Ordenar os chunks numericamente
-	sort.Slice(chunks, func(i, j int) bool {
-		return vc.extractNumber(chunks[i]) < vc.extractNumber(chunks[j])
-	})
-
-	// Criar arquivo de saída
-	output, err := os.Create(outputFile)
-	if err != nil {
-		return fmt.Errorf("failed to create merged file: %v", err)
-	}
-	defer output.Close()
-
-	// Ler cada chunk e escrever no arquivo final
-	for _, chunk := range chunks {
-		input, err := os.Open(chunk)
-		if err != nil {
-			return fmt.Errorf("failed to open chunk %s: %v", chunk, err)
-		}
-
-		// Copiar dados do chunk para o arquivo de saída
-		_, err = output.ReadFrom(input)
-		if err != nil {
-			return fmt.Errorf("failed to write chunk %s to merged file: %v", chunk, err)
-		}
-		input.Close()
-	}
-	return nil
-}
-
-// logError handles logging the error in JSON format
-func (vc *VideoConverter) logError(task VideoTask, message string, err error) {
-	errorData := map[string]interface{}{
-		"video_id": task.VideoID,
-		"error":    message,
+func (vc *VideoConverter) LogError(thread VideoTask, message string, err error) {
+	errData := map[string]any{
+		"video_id": thread.VideoId,
+		"message":  message,
 		"details":  err.Error(),
 		"time":     time.Now(),
 	}
 
-	serializedError, _ := json.Marshal(errorData)
-	slog.Error("Processing error", slog.String("error_details", string(serializedError)))
+	errSerialized, _ := json.Marshal(errData)
+	slog.Error("Processing error", slog.String("data", string(errSerialized)))
 
-	RegisterError(vc.db, errorData, err)
+	// remember to persist error in a database
+	RegisterError(vc.DB, errData, err)
+}
+
+func (vc *VideoConverter) process(
+	thread *VideoTask,
+	convertedFileName,
+	mergedFileName string) error {
+	mergedFile := filepath.Join(thread.Path, mergedFileName)
+	convertedFilePathFolder := filepath.Join(thread.Path, "mpeg-dash")
+
+	slog.Info("Merging chunks", slog.String("path", thread.Path))
+
+	err := vc.mergeChunksFromDir(thread.Path, mergedFile)
+	if err != nil {
+		errMessage := "Failed to merge chunks for VideoId=" + string(thread.VideoId)
+
+		vc.LogError(*thread, errMessage, err)
+		// return fmt.Errorf("%s: %v", errMessage, err)
+		return err
+	}
+
+	err = os.MkdirAll(convertedFilePathFolder, os.ModePerm)
+	if err != nil {
+		vc.LogError(*thread, "Failed to create directory for mpeg-dash files", err)
+		return err
+	}
+
+	slog.Info("Converting video", slog.String("path", thread.Path))
+	ffmpegCommand := exec.Command("ffmpeg", "-i", mergedFile,
+		"-f", "dash", filepath.Join(convertedFilePathFolder, convertedFileName))
+
+	out, err := ffmpegCommand.CombinedOutput()
+	if err != nil {
+		vc.LogError(*thread, "Failed to convert video to mpeg-dash format [outstream: "+string(out)+"]",
+			err)
+		return err
+	}
+
+	slog.Info("Video Successfully converted to mpeg-dash", slog.Int("video_id", thread.VideoId), slog.String("pathConverted", convertedFilePathFolder))
+
+	slog.Info("Deleting non-converted video", slog.Int("video_id", thread.VideoId), slog.String("path", mergedFile))
+	err = os.Remove(mergedFile)
+	if err != nil {
+		vc.LogError(*thread, "Failed to remove non-converted file for VideoId="+string(thread.VideoId), err)
+		return err
+	}
+
+	return nil
+}
+
+// will return the number from filename, returns -1 in case of error
+func (vc *VideoConverter) getNumberFromFile(filename string) int {
+	regex := regexp.MustCompile(`\d+`)
+
+	str := regex.FindString(filepath.Base(filename))
+
+	num, err := strconv.Atoi(str)
+
+	if err != nil {
+		return -1
+	}
+
+	return num
+}
+
+func (vc *VideoConverter) mergeChunksFromDir(inDir, outFile string) error {
+	pattern := "*.chunk"
+
+	chunks, err := filepath.Glob(filepath.Join(inDir, pattern))
+
+	if err != nil {
+		return fmt.Errorf("failed to find any chunk: %v", err)
+	}
+
+	sort.Slice(
+		chunks, func(i, j int) bool {
+			return vc.getNumberFromFile(chunks[i]) < vc.getNumberFromFile(chunks[j])
+		})
+
+	out, err := os.Create(outFile)
+	if err != nil {
+		return fmt.Errorf("failed to create a file: %v", err)
+	}
+
+	// will close, after function execution for not having memory leak
+	defer out.Close()
+
+	for _, chunk := range chunks {
+		in, err := os.Open(chunk)
+		if err != nil {
+			return fmt.Errorf("failed to open chunk: %v", err)
+		}
+
+		_, err = out.ReadFrom(in)
+		if err != nil {
+			return fmt.Errorf("failed to write chunk %s: %v", chunk, err)
+		}
+
+		in.Close()
+	}
+
+	return nil
 }

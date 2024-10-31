@@ -1,3 +1,5 @@
 cmd/videoconverter/media/
 .docker
 mediatest/html/media/
+mpeg-dash/
+app/
